@@ -52,21 +52,39 @@ The final status is derived **deterministically** from those four booleans (`_st
 
 ---
 
-## Economic flow
+## Claim lifecycle (v2)
 
 ```
-submit_claim (bond) ──► verdict stored
-        │
-        ├── no challenge ──► submitter calls settle() ──► bond back to submitter
-        │
-        └── challenge (bond) ──► report re-checked by validators
-                 ├── verdict changes ──► challenger gets both bonds
-                 └── verdict same    ──► submitter gets both bonds
+submit_claim (bond) ──► validators check now ──► PENDING_CHALLENGE
+                                                   │  (now < challenge_deadline)
+                                                   │  challenge() allowed
+                                                   │  settle() rejected
+                                                   │  is_verified() = false
+        ┌──────────────────────────────────────────┤
+        │                                          │
+ challenge (bond) inside the window         window closes
+ report re-checked by validators            verdict is FINAL
+   ├── verdict changes   ─► challenger gets both bonds      challenge() rejected
+   ├── verdict same      ─► submitter gets both bonds       settle() allowed ─► bond back
+   └── page unreachable  ─► INCONCLUSIVE: both refunded,
+                            claim becomes UNREACHABLE
+        │                                          │
+        └──────────── final verdict ───────────────┘
+                           │
+              now >= expires_at ─► EXPIRED (no longer current)
 ```
 
-- One challenge per claim, which keeps the game bounded.
-- Payouts are credited to an internal balance. Users pull funds with `withdraw()`, so the contract never pushes funds mid-logic.
-- `min_bond` is set at deploy time and stops spam claims.
+Rules, enforced in code:
+
+- `challenge_deadline = submitted_at + challenge_window_seconds`. `challenge()` works only while `now < challenge_deadline`. `settle()` works only when `now >= challenge_deadline`. **A claim can never be settled before it could have been challenged.**
+- `expires_at = checked_at + verdict_ttl_seconds`. A re-check during a challenge resets `checked_at`.
+- **What counts as current:** `is_verified()` is `true` only for a `VERIFIED` verdict that is **final** (window closed or challenge resolved) and **not expired**. During the window, `get_status()` returns `PENDING_CHALLENGE`.
+- **Settled claims:** `settle()` only returns the bond. It does not change or extend the verdict. A settled claim stays current until `expires_at`, then shows `EXPIRED`.
+- **Expired claims:** expiry is computed from the transaction clock inside the view, so nobody has to call anything for a stale claim to stop counting. To renew, submit the claim again; validators re-check the report.
+- A token is `VERIFIED` if **any** of its last 20 claims is VERIFIED, final and not expired, so a later junk claim cannot hide a valid report. Otherwise the newest claim's current status is shown.
+- One challenge per claim. The submitter cannot challenge their own claim.
+- Payouts go to an internal balance; users pull funds with `withdraw()`.
+- Deploy parameters: `min_bond`, `challenge_window_seconds` (60 s – 30 days), `verdict_ttl_seconds` (> window, ≤ 1 year).
 
 Why challenges matter: audit pages change. An auditor may later mark a project as "revoked" or remove the page. A challenge forces a fresh check by a new validator set.
 
@@ -77,20 +95,22 @@ Why challenges matter: audit pages change. An auditor may later mark a project a
 ### Write
 | Method | Description |
 |---|---|
-| `submit_claim(token_address, chain, auditor, report_url)` *payable* | Submit a claim with a bond; verified immediately. Returns `claim_id` |
-| `challenge(claim_id)` *payable* | Dispute the verdict with a bond; re-checked and settled |
-| `settle(claim_id)` | Submitter ends an unchallenged claim and receives the bond |
+| `submit_claim(token_address, chain, auditor, report_url)` *payable* | Submit a claim with a bond; checked now, provisional until the window closes. Returns `claim_id` |
+| `challenge(claim_id)` *payable* | Dispute the verdict **inside the challenge window**; re-checked and resolved |
+| `settle(claim_id)` | **After the window**, return the submitter's bond (anyone may call) |
 | `withdraw()` | Withdraw credited funds |
 
 ### View
 | Method | Description |
 |---|---|
-| `is_verified(token_address)` | `true` only if the latest claim is `VERIFIED` |
-| `get_status(token_address)` | Latest status, or `NO_CLAIM` |
-| `get_claim(claim_id)` | Full claim JSON (checks, bonds, challenge result) |
+| `is_verified(token_address)` | `true` only for a final, unexpired `VERIFIED` verdict |
+| `get_status(token_address)` | `NO_CLAIM`, `PENDING_CHALLENGE`, `VERIFIED`, `FAKE`, `ADDRESS_MISMATCH`, `UNREACHABLE` or `EXPIRED` |
+| `is_verified_at(token_address, unix_time)` / `get_status_at(...)` | Same, for a caller-supplied time |
+| `get_claim(claim_id)` | Full claim JSON plus `current_status`, `can_challenge`, `can_settle` |
+| `get_token_claims(token_address)` | Claim ids for a token |
 | `get_credit(address_hex)` | Withdrawable balance |
 | `get_supported_auditors()` | Auditor → official domains |
-| `get_claim_count()` | Total claims |
+| `get_claim_count()` / `get_config()` | Totals and deploy settings |
 
 `chain` is `"evm"` or `"solana"`. `auditor` is one of: `certik`, `hacken`, `cyberscope`, `solidproof`, `openzeppelin`, `trailofbits`, `quantstamp`.
 
@@ -113,7 +133,7 @@ if audit.view().is_verified(token_address):
 - **Address check is literal.** The LLM is not trusted with exact strings.
 - **LLM output is reduced to booleans.** This keeps `strict_eq` practical.
 - **Page text is capped at 15k characters.** This bounds prompt size and cost.
-- **Latest claim wins per token.** A re-submission or challenge updates what `is_verified` returns.
+- **Verdicts are provisional, then final, then expire.** See the claim lifecycle above.
 - **Pull payments.** This is a safer funds pattern.
 
 ## Limitations
@@ -125,15 +145,35 @@ if audit.view().is_verified(token_address):
 ## Files
 
 ```
-contracts/audit_proof.py   # the Intelligent Contract
-tests/TEST_PLAN.md         # manual test cases for GenLayer Studio
+contracts/audit_proof.py      # the Intelligent Contract (deployed source)
+tests/test_audit_proof.py     # offline unit tests: python -m unittest tests/test_audit_proof.py -v
+tests/TEST_PLAN.md            # test map + manual Studio test cases
+evidence/                     # Studio screenshots of the lifecycle test
 ```
+
+## Deployment
+
+Deployed v2 contract (GenLayer Studio): [`0x22b7eF48f35AcC552391A3bA0633326017c4d40B`](https://explorer-studio.genlayer.com/address/0x22b7eF48f35AcC552391A3bA0633326017c4d40B) (deployed with `min_bond=0`, `challenge_window_seconds=600`, `verdict_ttl_seconds=900` for the Studio lifecycle test)
+
+The deployed contract is exactly `contracts/audit_proof.py` in this repo.
+
+### Studio lifecycle evidence (contract `0x22b7eF48…d40B`, window 600 s, TTL 900 s)
+
+| Step | Call | Result |
+|---|---|---|
+| 1 | `submit_claim("0xdAC17F958D2ee523a2206206994597C13D831ec7", "evm", "certik", "https://www.certik.com/")` | `"0"` — verdict `FAKE` (homepage, not a report), validators agree |
+| 2 | `settle("0")` immediately after submit | **Error `challenge window still open`** — validators agree |
+| 3 | `challenge("0")` from a second account, inside the window | `"SUBMITTER_WON"` — re-check gave the same verdict |
+| 4 | `get_status(token)` after the challenge | `"FAKE"` (final) |
+| 5 | `get_status(token)` 15 minutes after the re-check | **`"EXPIRED"`** |
+
+Screenshots are in [`evidence/`](evidence/). The earlier test deploy `0x0C40Ec26…2fb0` (window 120 s) also showed `settle("0")` succeeding after the window closed.
 
 ## Deploy (GenLayer Studio)
 
 1. Open https://studio.genlayer.com
 2. Create a new contract and paste `contracts/audit_proof.py`
-3. Deploy with `min_bond` = `0` for testing, or a small value
+3. Deploy with `min_bond` = `0`, `challenge_window_seconds` = `600`, `verdict_ttl_seconds` = `900` for testing (production example: `3600` / `2592000`)
 4. Run the cases in `tests/TEST_PLAN.md`
 
 License: MIT
